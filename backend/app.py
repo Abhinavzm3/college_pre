@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template
 import pandas as pd
+import numpy as np
 
 app = Flask(__name__)
 
@@ -31,34 +32,41 @@ def compute_probability(rank: int, opening: float, closing: float) -> float:
         return 0.0
     # Linear interpolation
     prob = (closing - rank) / (closing - opening)
-    return max(0.0, min(1.0, prob)) * 100.0
+    return max(0.0, min(100.0, prob * 100))
 
 # 3) Route: serve the main HTML page
 @app.route("/")
 def index():
     return render_template("index.html")
 
-# 4) POST /predict (includes "round" and rank-extremes logic)
+# 4) POST /predict (fixed probability calculation)
 @app.route("/predict", methods=["POST"])
 def predict():
-    data = request.get_json()
-    if not data:
+    # Validate JSON exists
+    if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
-
-    # Parse inputs
-    try:
-        user_rank  = int(data.get("user_rank", -1))
-        quota      = data.get("quota", "").strip()
-        category   = data.get("category", "").strip()
-        gender     = data.get("gender", "").strip()
-        round_name = data.get("round", "").strip()
-        top_n      = int(data.get("top_n", 10))
-    except Exception as e:
-        return jsonify({"error": f"Invalid input fields: {e}"}), 400
-
+    
+    data = request.get_json()
+    
     # Validate required fields
-    if user_rank < 0 or not quota or not category or not gender or not round_name:
-        return jsonify({"error": "Missing or invalid field(s)"}), 400
+    required_fields = ["user_rank", "quota", "category", "gender", "round"]
+    for field in required_fields:
+        if field not in data or not str(data[field]).strip():
+            return jsonify({"error": f"Missing required field: {field}"}), 400
+
+    # Parse inputs with validation
+    try:
+        user_rank = int(data["user_rank"])
+        if user_rank <= 0:
+            raise ValueError("Rank must be positive integer")
+            
+        quota = data["quota"].strip()
+        category = data["category"].strip()
+        gender = data["gender"].strip()
+        round_name = data["round"].strip()
+        top_n = int(data.get("top_n", 10))
+    except Exception as e:
+        return jsonify({"error": f"Invalid input: {str(e)}"}), 400
 
     # Filter by quota, category, gender, and round
     subset = df[
@@ -70,91 +78,90 @@ def predict():
 
     # If no rows match those filters, return empty list
     if subset.empty:
-        return jsonify({"predictions": []})
+        return jsonify({
+            "predictions": [],
+            "message": "No colleges found for the selected filters"
+        })
 
-    # Extract the numeric arrays of opening/closing ranks
-    openings = subset["Opening Rank"].dropna().values
-    closings = subset["Closing Rank"].dropna().values
-
-    # If user_rank is lower (better) than the minimum opening rank,
-    # return *all* rows with 100% probability
-    min_open = float(openings.min()) if len(openings) > 0 else None
-    max_close = float(closings.max()) if len(closings) > 0 else None
-
+    # Calculate probabilities for all valid colleges
     matches = []
-
-    if min_open is not None and user_rank <= min_open:
-        # Lower (better) than every opening: include all rows
-        for _, row in subset.iterrows():
-            op = row["Opening Rank"]
-            cl = row["Closing Rank"]
-            if pd.isna(op) or pd.isna(cl):
-                continue
+    for _, row in subset.iterrows():
+        op = row["Opening Rank"]
+        cl = row["Closing Rank"]
+        
+        # Skip rows with invalid rank data
+        if pd.isna(op) or pd.isna(cl):
+            continue
+            
+        prob = compute_probability(user_rank, op, cl)
+        
+        # Only include colleges with non-zero probability
+        if prob > 0:
             matches.append({
                 "Institute": row["Institute"].strip(),
                 "Program": row["Program"].strip(),
                 "Opening Rank": float(op),
                 "Closing Rank": float(cl),
-                "Probability": 100.0
+                "Probability": round(prob, 2)
             })
-    else:
-        # If user_rank is worse than (>) the maximum closing, return no matches
-        if max_close is not None and user_rank > max_close:
-            return jsonify({"predictions": []})
 
-        # Otherwise, find all rows where Opening Rank ≤ user_rank ≤ Closing Rank
-        for _, row in subset.iterrows():
-            op = row["Opening Rank"]
-            cl = row["Closing Rank"]
-
-            if pd.isna(op) or pd.isna(cl):
-                continue
-
-            if (user_rank <= cl) and (user_rank >= op):
-                prob = compute_probability(user_rank, op, cl)
-                matches.append({
-                    "Institute": row["Institute"].strip(),
-                    "Program": row["Program"].strip(),
-                    "Opening Rank": float(op),
-                    "Closing Rank": float(cl),
-                    "Probability": round(prob, 2)
-                })
-
-    # Sort matches by **Probability ascending**, then by Closing Rank ascending
+    # Sort by highest probability first, then by closing rank (most selective first)
     matches.sort(key=lambda x: (x["Probability"], x["Closing Rank"]))
 
     # Return up to top_n results
     top_matches = matches[:top_n]
+    
+    # Add warning if no matches but data exists
+    if not top_matches:
+        min_close = subset["Closing Rank"].min()
+        max_open = subset["Opening Rank"].max()
+        return jsonify({
+            "predictions": [],
+            "message": f"No colleges found. Your rank {user_rank} is outside range. " +
+                      f"Valid range for filters: Opening ≤ {max_open}, Closing ≥ {min_close}"
+        })
+        
     return jsonify({"predictions": top_matches})
 
-
-# 5) GET /college-info (unchanged)
+# 5) GET /college-info (improved error handling)
 @app.route("/college-info", methods=["GET"])
 def college_info():
-    name_param    = request.args.get("name", "").strip()
+    name_param = request.args.get("name", "").strip()
     program_param = request.args.get("program", "").strip()
+    
     if not name_param:
         return jsonify({"error": "Query parameter 'name' is required."}), 400
 
-    mask = df["Institute"].str.contains(name_param, case=False, na=False)
-    if program_param:
-        mask &= df["Program"].str.contains(program_param, case=False, na=False)
+    try:
+        mask = df["Institute"].str.contains(name_param, case=False, na=False)
+        if program_param:
+            mask &= df["Program"].str.contains(program_param, case=False, na=False)
 
-    filtered = df[mask].copy()
-    results = []
-    for _, row in filtered.iterrows():
-        results.append({
-            "Institute": row["Institute"].strip(),
-            "Program": row["Program"].strip(),
-            "Quota": row["Quota"].strip(),
-            "Category": row["Category"].strip(),
-            "Opening Rank": float(row["Opening Rank"]),
-            "Closing Rank": float(row["Closing Rank"])
+        filtered = df[mask].copy()
+        results = []
+        for _, row in filtered.iterrows():
+            # Handle NaN values in rank columns
+            opening = row["Opening Rank"]
+            closing = row["Closing Rank"]
+            
+            results.append({
+                "Institute": row["Institute"].strip(),
+                "Program": row["Program"].strip(),
+                "Quota": row["Quota"].strip(),
+                "Category": row["Category"].strip(),
+                "Opening Rank": float(opening) if not pd.isna(opening) else "N/A",
+                "Closing Rank": float(closing) if not pd.isna(closing) else "N/A"
+            })
+
+        return jsonify({
+            "count": len(results),
+            "results": results,
+            "message": f"Found {len(results)} matches" if results else "No colleges found"
         })
-
-    return jsonify({"count": len(results), "results": results})
+        
+    except Exception as e:
+        return jsonify({"error": f"Processing error: {str(e)}"}), 500
 
 
 if __name__ == "__main__":
-    # Debug mode for local testing
     app.run(host="0.0.0.0", port=5000, debug=True)
