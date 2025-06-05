@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template,send_from_directory
 import pandas as pd
 import numpy as np
 
@@ -123,6 +123,10 @@ def predict():
         
     return jsonify({"predictions": top_matches})
 
+@app.route('/ads.txt')
+def serve_ads_txt():
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    return send_from_directory(project_root, 'ads.txt', mimetype='text/plain')
 # 5) GET /college-info (improved error handling)
 @app.route("/college-info", methods=["GET"])
 def college_info():
